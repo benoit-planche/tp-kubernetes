@@ -1,5 +1,14 @@
 terraform {
-  required_version = ">= 1.0.0"
+  required_providers {
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = ">= 1.14.0"
+    }
+  }
+}
+
+provider "kubectl" {
+  config_path = "~/.kube/config"
 }
 
 # Vérifier si Docker est installé
@@ -48,6 +57,93 @@ resource "null_resource" "configure_kubectl" {
   depends_on = [null_resource.create_cluster]
 }
 
+# Installer la Gateway API
+resource "null_resource" "install_gateway_api" {
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig ~/.kube/config apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v0.6.1/standard-install.yaml"
+  }
+  depends_on = [null_resource.configure_kubectl]
+}
+
+# Installer Istio
+resource "null_resource" "install_istio" {
+  provisioner "local-exec" {
+    command = <<-EOT
+      curl -L https://istio.io/downloadIstio | sh -
+      cd istio-*
+      export PATH=$PWD/bin:$PATH
+      istioctl install --set profile=demo -y
+    EOT
+  }
+  depends_on = [null_resource.install_gateway_api]
+}
+
+# Activer Istio
+resource "null_resource" "enable_istio_injection" {
+  provisioner "local-exec" {
+    command = "kubectl label namespace default istio-injection=enabled --kubeconfig ~/.kube/config"
+  }
+  depends_on = [null_resource.install_istio]
+}
+
+# Deployer virtualService et destinationRule
+resource "kubectl_manifest" "virtual_service" {
+  yaml_body = <<YAML
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: my-app
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - my-gateway
+  http:
+  - match:
+    - uri:
+        prefix: "/v1"
+    route:
+    - destination:
+        host: my-service
+        subset: v1
+  - match:
+    - uri:
+        prefix: "/v2"
+    route:
+    - destination:
+        host: my-service
+        subset: v2
+YAML
+  depends_on = [null_resource.enable_istio_injection]
+}
+
+resource "kubectl_manifest" "destination_rule" {
+  yaml_body = <<YAML
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: my-service-dr
+spec:
+  host: my-service
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+    outlierDetection:
+      consecutiveErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+YAML
+  depends_on = [null_resource.enable_istio_injection]
+}
+
+
 # Vérifier l'installation
 resource "null_resource" "verify_installation_cluster" {
   provisioner "local-exec" {
@@ -66,5 +162,13 @@ kubectl get nodes --kubeconfig ~/.kube/config
 kubectl get pods -n kube-system --kubeconfig ~/.kube/config
 EOT
   }
-  depends_on = [null_resource.configure_kubectl]
+  depends_on = [null_resource.install_istio]
+}
+
+# Deployer l'application
+resource "null_resource" "deploy_app" {
+  provisioner "local-exec" {
+    command = "kubectl apply -f ./app/deploiement.yaml --kubeconfig ~/.kube/config"
+  }
+  depends_on = [null_resource.verify_installation_cluster]
 }
