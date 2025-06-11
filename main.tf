@@ -4,11 +4,21 @@ terraform {
       source  = "gavinbunney/kubectl"
       version = ">= 1.14.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.0.0"
+    }
   }
 }
 
+provider "kubernetes" {
+  config_path    = "~/.kube/config"
+  config_context = "k3d-mycluster"
+}
+
 provider "kubectl" {
-  config_path = "~/.kube/config"
+  config_path    = "~/.kube/config"
+  config_context = "k3d-mycluster"
 }
 
 # Vérifier si Docker est installé
@@ -33,39 +43,43 @@ resource "null_resource" "install_k3d" {
   depends_on = [null_resource.check_k3d]
 }
 
-# Créer le cluster k3d
+# --- Création du cluster k3d ---
 resource "null_resource" "create_cluster" {
   provisioner "local-exec" {
     command = <<-EOT
       k3d cluster create mycluster \
         --servers 1 \
-        --agents ${var.worker_count} \
+        --agents 3 \
         --port 80:80@loadbalancer \
         --port 443:443@loadbalancer \
         --k3s-arg '--disable=traefik@server:0' \
-        --k3s-arg '--disable=servicelb@server:0'
+        --k3s-arg '--disable=servicelb@server:0' \
+        --k3s-arg '--tls-san=0.0.0.0@server:0'
     EOT
   }
-  depends_on = [null_resource.install_k3d]
 }
 
-# Configurer kubectl
+# --- Configuration kubectl ---
 resource "null_resource" "configure_kubectl" {
   provisioner "local-exec" {
-    command = "k3d kubeconfig get mycluster > ~/.kube/config"
+    command = <<-EOT
+      k3d kubeconfig get mycluster > ~/.kube/config
+      echo "Waiting for cluster to be ready..."
+      for i in {1..30}; do
+        if kubectl get nodes > /dev/null 2>&1; then
+          echo "Cluster is ready!"
+          exit 0
+        fi
+        echo "Waiting for cluster to be ready... (attempt $i/30)"
+        sleep 5
+      done
+      echo "Cluster not ready after timeout" && exit 1
+    EOT
   }
   depends_on = [null_resource.create_cluster]
 }
 
-# Installer la Gateway API
-resource "null_resource" "install_gateway_api" {
-  provisioner "local-exec" {
-    command = "kubectl --kubeconfig ~/.kube/config apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v0.6.1/standard-install.yaml"
-  }
-  depends_on = [null_resource.configure_kubectl]
-}
-
-# Installer Istio
+# --- Installation d'Istio ---
 resource "null_resource" "install_istio" {
   provisioner "local-exec" {
     command = <<-EOT
@@ -75,22 +89,106 @@ resource "null_resource" "install_istio" {
       istioctl install --set profile=demo -y
     EOT
   }
-  depends_on = [null_resource.install_gateway_api]
+  depends_on = [null_resource.configure_kubectl]
 }
 
-# Installer les composants d'observabilité
+# --- Vérification de l'installation d'Istio ---
+resource "null_resource" "wait_istio_crds" {
+  provisioner "local-exec" {
+    command = <<EOT
+      echo "Waiting for Istio installation to complete..."
+      for i in {1..60}; do
+        if kubectl get pods -n istio-system --kubeconfig ~/.kube/config | grep -q "Running"; then
+          echo "Istio pods are running, waiting for CRDs..."
+          for j in {1..30}; do
+            if kubectl get crd virtualservices.networking.istio.io --kubeconfig ~/.kube/config >/dev/null 2>&1 && \
+               kubectl get crd destinationrules.networking.istio.io --kubeconfig ~/.kube/config >/dev/null 2>&1; then
+              echo "Istio CRDs are ready!"
+              exit 0
+            fi
+            echo "Waiting for Istio CRDs... (attempt $j/30)"
+            sleep 5
+          done
+        fi
+        echo "Waiting for Istio pods to be ready... (attempt $i/60)"
+        sleep 5
+      done
+      echo "Istio installation or CRDs not ready after timeout" && exit 1
+    EOT
+  }
+  depends_on = [null_resource.install_istio]
+}
+
+# --- Installation des composants d'observabilité ---
 resource "null_resource" "install_observability" {
   provisioner "local-exec" {
     command = <<-EOT
       cd istio-*
       export PATH=$PWD/bin:$PATH
-      kubectl apply -f samples/addons/prometheus.yaml --kubeconfig ~/.kube/config
+      kubectl apply -f samples/addons/prometheus.yaml --kubeconfig ~/.kube/config 
       kubectl apply -f samples/addons/grafana.yaml --kubeconfig ~/.kube/config
       kubectl apply -f samples/addons/kiali.yaml --kubeconfig ~/.kube/config
-      kubectl apply -f samples/addons/jaeger.yaml --kubeconfig ~/.kube/config
     EOT
   }
-  depends_on = [null_resource.install_istio]
+  depends_on = [null_resource.wait_istio_crds]
+}
+
+# --- Déploiement de PostgreSQL ---
+resource "kubectl_manifest" "postgres_configmap" {
+  yaml_body  = file("${path.module}/manifests/postgres-configmap.yaml")
+  depends_on = [null_resource.wait_istio_crds]
+}
+
+resource "kubectl_manifest" "postgres_pvc" {
+  yaml_body  = file("${path.module}/manifests/postgres-pvc.yaml")
+  depends_on = [kubectl_manifest.postgres_configmap]
+}
+
+resource "kubectl_manifest" "postgres_deployment" {
+  yaml_body  = file("${path.module}/manifests/postgres-deployment.yaml")
+  depends_on = [kubectl_manifest.postgres_pvc]
+}
+
+resource "kubectl_manifest" "postgres_service" {
+  yaml_body  = file("${path.module}/manifests/postgres-service.yaml")
+  depends_on = [kubectl_manifest.postgres_deployment]
+}
+
+# --- Build et import de l'image Docker ---
+resource "null_resource" "build_docker_image" {
+  provisioner "local-exec" {
+    command = "docker build -t flask-app:latest ."
+  }
+  depends_on = [null_resource.wait_istio_crds]
+}
+
+resource "null_resource" "import_docker_image" {
+  provisioner "local-exec" {
+    command = "k3d image import flask-app:latest -c mycluster"
+  }
+  depends_on = [null_resource.build_docker_image]
+}
+
+# --- Déploiement de l'application Flask ---
+resource "kubectl_manifest" "app_deployment" {
+  yaml_body  = file("${path.module}/manifests/app-deployment.yaml")
+  depends_on = [null_resource.import_docker_image, kubectl_manifest.postgres_service]
+}
+
+resource "kubectl_manifest" "app_service" {
+  yaml_body  = file("${path.module}/manifests/app-service.yaml")
+  depends_on = [kubectl_manifest.app_deployment]
+}
+
+# --- Configuration Istio pour l'application ---
+resource "kubectl_manifest" "app_gateway" {
+  yaml_body  = file("${path.module}/manifests/app-gateway.yaml")
+  depends_on = [kubectl_manifest.app_service]
+}
+
+resource "kubectl_manifest" "app_virtualservice" {
+  yaml_body  = file("${path.module}/manifests/app-virtualservice.yaml")
+  depends_on = [kubectl_manifest.app_gateway]
 }
 
 # Configurer Grafana
@@ -171,68 +269,10 @@ resource "kubectl_manifest" "grafana_service" {
 # Activer Istio
 resource "null_resource" "enable_istio_injection" {
   provisioner "local-exec" {
-    command = "kubectl label namespace default istio-injection=enabled --kubeconfig ~/.kube/config"
+    command = "kubectl label namespace default istio-injection=enabled"
   }
   depends_on = [null_resource.install_istio]
 }
-
-# Deployer virtualService et destinationRule
-resource "kubectl_manifest" "virtual_service" {
-  yaml_body  = <<YAML
-apiVersion: networking.istio.io/v1alpha3
-kind: VirtualService
-metadata:
-  name: my-app
-spec:
-  hosts:
-  - "*"
-  gateways:
-  - my-gateway
-  http:
-  - match:
-    - uri:
-        prefix: "/v1"
-    route:
-    - destination:
-        host: my-service
-        subset: v1
-  - match:
-    - uri:
-        prefix: "/v2"
-    route:
-    - destination:
-        host: my-service
-        subset: v2
-YAML
-  depends_on = [null_resource.enable_istio_injection]
-}
-
-resource "kubectl_manifest" "destination_rule" {
-  yaml_body  = <<YAML
-apiVersion: networking.istio.io/v1alpha3
-kind: DestinationRule
-metadata:
-  name: my-service-dr
-spec:
-  host: my-service
-  subsets:
-  - name: v1
-    labels:
-      version: v1
-  - name: v2
-    labels:
-      version: v2
-  trafficPolicy:
-    loadBalancer:
-      simple: ROUND_ROBIN
-    outlierDetection:
-      consecutiveErrors: 5
-      interval: 10s
-      baseEjectionTime: 30s
-YAML
-  depends_on = [null_resource.enable_istio_injection]
-}
-
 
 # Vérifier l'installation
 resource "null_resource" "verify_installation_cluster" {
@@ -255,110 +295,11 @@ EOT
   depends_on = [null_resource.install_istio]
 }
 
-# --- Build de l'image Docker ---
-resource "null_resource" "build_docker_image" {
-  provisioner "local-exec" {
-    command = "docker build --no-cache -t flask-app:latest ."
-  }
-  depends_on = [null_resource.verify_installation_cluster]
-}
-
-# --- Import de l'image Docker dans le cluster k3d ---
-resource "null_resource" "import_docker_image" {
-  provisioner "local-exec" {
-    command = "k3d image import flask-app:latest -c mycluster"
-  }
-  depends_on = [null_resource.build_docker_image]
-}
-
-# --- Déploiement PostgreSQL et Application Flask via kubectl_manifest ---
-resource "kubectl_manifest" "postgres_configmap" {
-  yaml_body  = file("${path.module}/manifests/postgres-configmap.yaml")
-  depends_on = [null_resource.verify_installation_cluster]
-}
-
-resource "kubectl_manifest" "postgres_pvc" {
-  yaml_body  = file("${path.module}/manifests/postgres-pvc.yaml")
-  depends_on = [kubectl_manifest.postgres_configmap]
-}
-
-resource "kubectl_manifest" "postgres_deployment" {
-  yaml_body  = file("${path.module}/manifests/postgres-deployment.yaml")
-  depends_on = [kubectl_manifest.postgres_pvc]
-}
-
-resource "kubectl_manifest" "postgres_service" {
-  yaml_body  = file("${path.module}/manifests/postgres-service.yaml")
-  depends_on = [kubectl_manifest.postgres_deployment]
-}
-
-resource "kubectl_manifest" "app_deployment" {
-  yaml_body  = file("${path.module}/manifests/app-deployment.yaml")
-  depends_on = [null_resource.import_docker_image, kubectl_manifest.postgres_service]
-}
-
-resource "kubectl_manifest" "app_service" {
-  yaml_body  = file("${path.module}/manifests/app-service.yaml")
-  depends_on = [kubectl_manifest.app_deployment]
-}
-
-# --- Configuration Istio pour l'application Flask ---
-resource "kubectl_manifest" "app_gateway" {
-  yaml_body  = <<YAML
-apiVersion: networking.istio.io/v1alpha3
-kind: Gateway
+resource "kubectl_manifest" "istio_system_ns" {
+  yaml_body = <<YAML
+apiVersion: v1
+kind: Namespace
 metadata:
-  name: flask-gateway
-spec:
-  selector:
-    istio: ingressgateway
-  servers:
-  - port:
-      number: 80
-      name: http
-      protocol: HTTP
-    hosts:
-    - "*"
+  name: istio-system
 YAML
-  depends_on = [kubectl_manifest.app_service]
-}
-
-resource "kubectl_manifest" "app_virtualservice" {
-  yaml_body  = <<YAML
-apiVersion: networking.istio.io/v1alpha3
-kind: VirtualService
-metadata:
-  name: flask-vs
-spec:
-  hosts:
-  - "*"
-  gateways:
-  - flask-gateway
-  http:
-  - match:
-    - uri:
-        prefix: /
-    route:
-    - destination:
-        host: flask-app
-        port:
-          number: 80
-YAML
-  depends_on = [kubectl_manifest.app_gateway]
-}
-
-# --- Ancien déploiement à commenter ---
-# resource "null_resource" "deploy_app" {
-#   provisioner "local-exec" {
-#     command = "kubectl apply -f ./app/deploiement.yaml --kubeconfig ~/.kube/config"
-#   }
-#   depends_on = [null_resource.verify_installation_cluster]
-# }
-
-# Deployer observabilité
-resource "null_resource" "deploy_observability" {
-  provisioner "local-exec" {
-    command = "kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.26/samples/addons/grafana.yaml --kubeconfig ~/.kube/config"
-  }
-  depends_on = [null_resource.verify_installation_cluster]
 }

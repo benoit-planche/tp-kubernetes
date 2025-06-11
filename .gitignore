@@ -27,3 +27,44 @@ terraform.rc
 .terraform.lock.hcl
 
 **/istio-*
+
+# Certificats TLS
+*.crt
+*.key
+*.pem
+
+# Fichiers de configuration Kubernetes
+kubeconfig
+.kube/
+
+# Fichiers Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Fichiers système
+.DS_Store
+Thumbs.db

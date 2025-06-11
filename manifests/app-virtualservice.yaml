@@ -1,0 +1,32 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: flask-vs
+spec:
+  gateways:
+  - flask-gateway
+  hosts:
+  - '*'
+  http:
+  - match:
+    - headers:
+        user-agent:
+          exact: curl
+    fault:
+      abort:
+        httpStatus: 429
+        percentage:
+          value: 100
+    route:
+    - destination:
+        host: flask-app
+        port:
+          number: 80
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: flask-app
+        port:
+          number: 80 
